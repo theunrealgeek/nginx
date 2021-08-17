@@ -65,6 +65,9 @@ typedef struct {
     off_t                            response_length;
     off_t                            bytes_received;
     off_t                            bytes_sent;
+		ngx_uint_t                       tcp_state;
+		ngx_uint_t                       tls_handshaked;
+		ngx_uint_t                       tls_handshake_rejected;
 
     ngx_str_t                       *peer;
 } ngx_http_upstream_state_t;

@@ -167,6 +167,10 @@ static ngx_int_t ngx_http_upstream_trailer_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_upstream_cookie_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_upstream_tls_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_upstream_tcp_state_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 
 static char *ngx_http_upstream(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy);
 static char *ngx_http_upstream_server(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -410,6 +414,18 @@ static ngx_http_variable_t  ngx_http_upstream_vars[] = {
 
     { ngx_string("upstream_bytes_sent"), NULL,
       ngx_http_upstream_response_length_variable, 2,
+      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
+		{ ngx_string("upstream_tcp_state"), NULL,
+      ngx_http_upstream_tcp_state_variable, 0,
+      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
+		{ ngx_string("upstream_tls_handshaked"), NULL,
+      ngx_http_upstream_tls_variable, 0,
+      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
+		{ ngx_string("upstream_tls_handshake_rejected"), NULL,
+      ngx_http_upstream_tls_variable, 1,
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
 #if (NGX_HTTP_CACHE)
@@ -4395,6 +4411,56 @@ ngx_http_upstream_cleanup(void *data)
     ngx_http_upstream_finalize_request(r, r->upstream, NGX_DONE);
 }
 
+/*
+TCP_ESTABLISHED = 1,
+  TCP_SYN_SENT,
+  TCP_SYN_RECV,
+  TCP_FIN_WAIT1,
+  TCP_FIN_WAIT2,
+  TCP_TIME_WAIT,
+  TCP_CLOSE,
+  TCP_CLOSE_WAIT,
+  TCP_LAST_ACK,
+  TCP_LISTEN,
+  TCP_CLOSING
+*/
+
+static char*
+ngx_upstream_get_tcp_state(uint8_t tcpi_state) {
+	char *ret = "UNKNOWN";
+
+	switch(tcpi_state) {
+		case TCP_ESTABLISHED:
+			ret = "TCP_ESTABLISHED";
+			break;
+		case TCP_SYN_SENT:
+			ret = "TCP_SYN_SENT";
+			break;
+		case TCP_SYN_RECV:
+			ret = "TCP_SYN_RECV";
+			break;
+		case TCP_FIN_WAIT1:
+			ret = "TCP_FIN_WAIT1";
+			break;
+		case TCP_FIN_WAIT2:
+			ret = "TCP_FIN_WAIT2";
+			break;
+		case TCP_TIME_WAIT:
+			ret = "TCP_TIME_WAIT";
+			break;
+		case TCP_CLOSE:
+			ret = "TCP_CLOSE";
+			break;
+		case TCP_CLOSE_WAIT:
+			ret = "TCP_CLOSE_WAIT";
+			break;
+		case TCP_LAST_ACK:
+			ret = "TCP_LAST_ACK";
+			break;
+	}
+	return ret;
+}
+
 
 static void
 ngx_http_upstream_finalize_request(ngx_http_request_t *r,
@@ -4441,6 +4507,14 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     }
 
     if (u->peer.connection) {
+			ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "trying to get sock info");
+			struct tcp_info info;
+			socklen_t infoLen = sizeof(struct tcp_info);
+			getsockopt(u->peer.connection->fd, SOL_TCP, TCP_INFO, (void *)&info, (socklen_t *)&infoLen);
+
+			ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "got tcp state %s", ngx_upstream_get_tcp_state(info.tcpi_state));
+			ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "done trying to get sock info");
+			u->state->tcp_state = info.tcpi_state;
 
 #if (NGX_HTTP_SSL)
 
@@ -4453,6 +4527,9 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
              * and do not wait its "close notify" shutdown alert.
              * It is acceptable according to the TLS standard.
              */
+
+						u->state->tls_handshaked = u->peer.connection->ssl->handshaked;
+						u->state->tls_handshake_rejected = u->peer.connection->ssl->handshake_rejected;
 
             u->peer.connection->ssl->no_wait_shutdown = 1;
 
@@ -5435,6 +5512,138 @@ ngx_http_upstream_addr_variable(ngx_http_request_t *r,
 
     return NGX_OK;
 }
+
+/* Extra stuff */
+static ngx_int_t
+ngx_http_upstream_tcp_state_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    u_char                     *p;
+    size_t                      len;
+    ngx_uint_t                  i;
+    ngx_http_upstream_state_t  *state;
+
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+
+    if (r->upstream_states == NULL || r->upstream_states->nelts == 0) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    len = r->upstream_states->nelts * (sizeof("TCP_ESTABLISHED")-1);
+
+    p = ngx_pnalloc(r->pool, len);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    v->data = p;
+
+    i = 0;
+    state = r->upstream_states->elts;
+
+    for ( ;; ) {
+        if (state[i].tcp_state) {
+            p = ngx_sprintf(p, "%s", ngx_upstream_get_tcp_state(state[i].tcp_state));
+
+        } else {
+            *p++ = '-';
+        }
+
+        if (++i == r->upstream_states->nelts) {
+            break;
+        }
+
+        if (state[i].peer) {
+            *p++ = ',';
+            *p++ = ' ';
+
+        } else {
+            *p++ = ' ';
+            *p++ = ':';
+            *p++ = ' ';
+
+            if (++i == r->upstream_states->nelts) {
+                break;
+            }
+
+            continue;
+        }
+    }
+
+    v->len = p - v->data;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_upstream_tls_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    u_char                     *p;
+    size_t                      len;
+    ngx_uint_t                  i;
+    ngx_http_upstream_state_t  *state;
+
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+
+    if (r->upstream_states == NULL || r->upstream_states->nelts == 0) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    len = r->upstream_states->nelts * (3 + 2);
+
+    p = ngx_pnalloc(r->pool, len);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    v->data = p;
+
+    i = 0;
+    state = r->upstream_states->elts;
+
+    for ( ;; ) {
+			  if (data == 0) {
+						p = ngx_sprintf(p, "%ui", state[i].tls_handshaked);
+				} else if(data == 1) {
+						p = ngx_sprintf(p, "%ui", state[i].tls_handshake_rejected);
+				}
+
+        if (++i == r->upstream_states->nelts) {
+            break;
+        }
+
+        if (state[i].peer) {
+            *p++ = ',';
+            *p++ = ' ';
+
+        } else {
+            *p++ = ' ';
+            *p++ = ':';
+            *p++ = ' ';
+
+            if (++i == r->upstream_states->nelts) {
+                break;
+            }
+
+            continue;
+        }
+    }
+
+    v->len = p - v->data;
+
+    return NGX_OK;
+}
+
+
+/* Done extra stuff */
 
 
 static ngx_int_t
