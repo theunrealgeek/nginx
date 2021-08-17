@@ -1553,6 +1553,12 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
     rc = ngx_event_connect_peer(&u->peer);
 
+		struct tcp_info t_info;
+		socklen_t infoLen = sizeof(struct tcp_info);
+		getsockopt(u->peer.connection->fd, SOL_TCP, TCP_INFO, (void *)&t_info, (socklen_t *)&infoLen);
+
+		u->state->tcp_state = t_info.tcpi_state;
+
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http upstream connect: %i", rc);
 
@@ -2083,6 +2089,12 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
     if (u->state->connect_time == (ngx_msec_t) -1) {
         u->state->connect_time = ngx_current_msec - u->start_time;
     }
+
+		struct tcp_info t_info;
+		socklen_t infoLen = sizeof(struct tcp_info);
+		getsockopt(u->peer.connection->fd, SOL_TCP, TCP_INFO, (void *)&t_info, (socklen_t *)&infoLen);
+
+		u->state->tcp_state = ngx_min(u->state->tcp_state, t_info.tcpi_state);
 
     if (!u->request_sent && ngx_http_upstream_test_connect(c) != NGX_OK) {
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
@@ -4514,7 +4526,7 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
 
 			ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "got tcp state %s", ngx_upstream_get_tcp_state(info.tcpi_state));
 			ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "done trying to get sock info");
-			u->state->tcp_state = info.tcpi_state;
+			u->state->tcp_state = ngx_min(u->state->tcp_state, info.tcpi_state);
 
 #if (NGX_HTTP_SSL)
 
